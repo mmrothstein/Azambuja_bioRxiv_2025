@@ -1,0 +1,509 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-11-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Load required libraries
+```{r}
+library(Seurat)
+library(Signac)
+library(tidyverse)
+library(AnnotationHub)
+library(JASPAR2020)
+library(TFBSTools)
+library(BSgenome.Ggallus.ENSEMBL.galGal6)
+library(pheatmap)
+library(biomaRt)
+library(cowplot)
+library(reshape2)
+library(plyr)
+library(quadprog)
+library(tradeSeq)
+```
+
+
+Load genome annotation
+```{r}
+# Setup Annotation
+ah = AnnotationHub()
+qr = query(ah, c("EnsDb", "gallus gallus", "101"))
+EnsDb_gg6 = ah[["AH83209"]]
+# extract gene annotations from EnsDb
+annotations = suppressWarnings(GetGRangesFromEnsDb(ensdb = EnsDb_gg6))
+annotations
+```
+
+
+Load RNA and ATAC hd5 files
+```{r}
+data = Read10X_h5("filtered_feature_bc_matrix.h5")
+rna = data$`Gene Expression`
+atac = data$Peaks
+```
+
+Create seurat object
+```{r}
+HH5 = CreateSeuratObject(counts=rna)
+HH5[["percent.mt"]] = PercentageFeatureSet(HH5, pattern = "^MT-")
+
+HH5_assay = CreateChromatinAssay(HH5_macs_counts, fragments = HH5_frag, 
+                                       ranges=atac,
+                                       genome=seqinfo(EnsDb_gg6), annotation=annotations)
+HH5[["ATAC"]] = HH5_assay
+```
+
+Subset seurat object based on QC metrics
+```{r}
+HH5_sub = subset(x=HH5,
+             subset = nCount_ATAC<8e4 & nCount_ATAC>4e3 & 
+               nCount_RNA<5000 & nCount_RNA>300 & percent.mt<10)
+HH5_sub #7750 cells
+```
+
+Run dimensionality reduction
+```{r}
+DefaultAssay(HH5_sub) = "RNA"
+HH5_sub = SCTransform(HH5_sub, verbose = FALSE) %>% RunPCA() %>% RunUMAP(dims = 1:50, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+
+DefaultAssay(HH5_sub) = "ATAC"
+HH5_sub = RunTFIDF(HH5_sub)
+HH5_sub = FindTopFeatures(HH5_sub, min.cutoff = 'q0')
+HH5_sub = RunSVD(HH5_sub)
+HH5_sub = RunUMAP(HH5_sub, reduction = 'lsi', dims = 2:50, reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+```
+
+Cell clustering
+```{r}
+HH5_sub = FindMultiModalNeighbors(HH5_sub, reduction.list=list("pca", "lsi"), 
+                                  dims.list = list(1:50, 2:50))
+HH5_sub = RunUMAP(HH5_sub, nn.name="weighted.nn", reduction.name="wnn.umap",
+                  reduction.key="wnnUMAP_")
+HH5_sub = FindClusters(HH5_sub, graph.name = "wsnn", algorithm = 3, verbose = FALSE)
+```
+
+Add motifs to Seurat object
+```{r}
+DefaultAssay(HH5_sub) = "ATAC"
+pfm = getMatrixSet(x = JASPAR2020, opts = list(species = 9606, all_versions = FALSE))
+
+motif.matrix = CreateMotifMatrix(features = granges(HH5_sub), pwm=pfm, 
+                                  genome=BSgenome.Ggallus.ENSEMBL.galGal6, use.counts = FALSE)
+motif.object = CreateMotifObject(data = motif.matrix, pwm=pfm)
+
+HH5_sub = SetAssayData(HH5_sub, assay = 'ATAC', slot = 'motifs', new.data = motif.object)
+HH5_sub = RunChromVAR(object=HH5_sub, genome=BSgenome.Ggallus.ENSEMBL.galGal6)
+```
+
+Assign cluster identities
+```{r}
+Idents(object = HH5_sub) <- HH5_sub@meta.data$cluster_no
+HH5_sub = RenameIdents(HH5_sub, '2'='mesoderm-1', '0'='mesoderm-2', '14'='mesoderm-3', 
+                       '5'='mesoderm-4', '11'='mesoderm-5', '12'='mesoderm-6', '3'='primitive streak',
+                       '1'='neural ectoderm-1', '4'='neural ectoderm-2', '6'='nonneural ectoderm-2',
+                       '10'='nonneural ectoderm-1', '8'='endoderm', '15'='notochord', '9'='blood islands',
+                       '7'='extraembryonic endoderm')
+HH5_sub = RenameIdents(HH5_sub, "13"="area opaca")
+```
+
+Plot RNA, ATAC, and WNN UMAPs
+```{r}
+p1 = DimPlot(HH5_sub, reduction="wnn.umap", repel = TRUE, pt.size=0.3) + 
+  ggtitle("WNN") + scale_colour_manual(values=c("#929292", "#FA75B0", "#9D0041", "#B2019C", "#F2A2A6", "#CC8FAB", "#D19DEA", "#8B45AC", "#054D80", "#5598C7", "#007885", "#98D2D8", "#EFC40D","#BE3B2C", "#016C56", "#5E5E5E"))
+
+p2 = DimPlot(HH5_sub, reduction="umap.atac", repel = TRUE, pt.size=0.3) + NoLegend() +
+  ggtitle("ATAC") + scale_colour_manual(values=c("#929292", "#FA75B0", "#9D0041", "#B2019C", "#F2A2A6", "#CC8FAB", "#D19DEA","#8B45AC", "#054D80", "#5598C7", "#007885", "#98D2D8", "#EFC40D",
+"#BE3B2C", "#016C56", "#5E5E5E"))
+
+p3 = DimPlot(HH5_sub, reduction="umap.rna", repel = TRUE, pt.size=0.3) + NoLegend() +
+  ggtitle("RNA") + scale_colour_manual(values=c("#929292", "#FA75B0", "#9D0041", "#B2019C", "#F2A2A6", "#CC8FAB", "#D19DEA","#8B45AC", "#054D80", "#5598C7", "#007885", "#98D2D8", "#EFC40D",
+"#BE3B2C", "#016C56", "#5E5E5E"))
+p3 | p2 | p1
+```
+
+Load anterior/posterior peaks
+```{r}
+library(GenomicRanges)
+anterior_peaks = read.table("anterior_peaks_TradeSeq.bed") %>% dplyr::rename('CHR'='V1', 'START'='V2', 'END'='V3') %>% GRanges() %>%
+  GRangesToString(sep = c("-", "-"))
+
+posterior_peaks = read.table("posterior_peaks_TradeSeq.bed") %>% dplyr::rename('CHR'='V1', 'START'='V2', 'END'='V3') %>% GRanges() %>%
+  GRangesToString(sep = c("-", "-"))
+```
+
+
+plot ant/post peaksets onto UMAP
+```{r}
+DefaultAssay(HH5_sub) = 'ATAC'
+features = list("anterior.peaks" = anterior_peaks, "posterior.peaks"=posterior_peaks)
+
+HH5_sub_mod = AddChromatinModule(HH5_sub, features,
+                   genome=BSgenome.Ggallus.ENSEMBL.galGal6)
+
+p1 = FeaturePlot(object=HH5_sub_mod, features=c('anterior.peaks'), reduction="wnn.umap", 
+  min.cutoff='q10', max.cutoff='q90', repel = TRUE, pt.size=0.3) + scale_colour_gradientn(colours=c("gray85", "#054D80"))
+
+p2 = FeaturePlot(object=HH5_sub_mod, features=c('posterior.peaks'), reduction="wnn.umap", 
+  min.cutoff='q10', max.cutoff='q90', repel = TRUE, pt.size=0.3) + scale_colour_gradientn(colours=c("gray85", "#9D0041"))
+p1 | p2
+```
+
+Calculate peak-gene links
+```{r}
+DefaultAssay(HH5_sub)='ATAC'
+HH5_sub = RegionStats(HH5_sub, genome = BSgenome.Ggallus.ENSEMBL.galGal6)
+HH5_sub = LinkPeaks(object = HH5_sub,
+  peak.assay = "ATAC", expression.assay = "RNA", distance=10e+05)
+```
+
+getExprByPt function
+```{r}
+getExprByPt = function(pt.vec, expr.mat, cell.num.per.bin=50, return.idx=FALSE){
+  start.idx = seq(from=1, to=length(pt.vec), by=cell.num.per.bin)
+  end.idx = c(start.idx[-1]-1,length(pt.vec))
+  dif = end.idx[length(end.idx)] - start.idx[length(start.idx)] + 1
+  if(dif<cell.num.per.bin*0.25){
+    start.idx = start.idx[-length(start.idx)]
+    end.idx = end.idx[-length(end.idx)]
+    end.idx[length(end.idx)] = length(pt.vec)
+  }
+  idx = cbind(start.idx, end.idx)
+  pt.rank = rank(pt.vec, ties.method = "first")
+  expr.by.pt.g = sapply(seq(nrow(idx)), function(i){
+    idx.start = idx[i,1]
+    idx.end = idx[i,2]
+    idx.cell = which(pt.rank>=idx.start & pt.rank<=idx.end)
+    rowSums(expr.mat[,names(idx.cell)])
+  })
+  if(!return.idx){
+    return(expr.by.pt.g)
+  }else{
+    res <- list("expr.mat"=expr.by.pt.g, "idx.mat"=idx)
+  }
+}
+```
+
+
+load chicken mart
+```{r}
+ensembl = biomaRt::useEnsembl(biomart = "genes", dataset = "ggallus_gene_ensembl")
+chick_BM = getBM(attributes = c('ensembl_gene_id', 'external_gene_name'), mart = ensembl)
+```
+
+Load anterior/posterior peaks
+```{r}
+anterior_peaks = read.table("anterior_peaks_TradeSeq.bed") %>% dplyr::rename('CHR'='V1', 'START'='V2', 'END'='V3') %>% GRanges() %>%
+  GRangesToString(sep = c("-", "-"))
+
+posterior_peaks = read.table("posterior_peaks_TradeSeq.bed") %>% dplyr::rename('CHR'='V1', 'START'='V2', 'END'='V3') %>% GRanges() %>%
+  GRangesToString(sep = c("-", "-"))
+
+all_peaks = c(anterior_peaks, posterior_peaks)
+```
+
+
+Remove extraembryonic cells from dataset
+```{r}
+DefaultAssay(HH5_sub)='ATAC'
+
+que.cells = colnames(HH5_sub)[which(!HH5_sub@active.ident %in%
+                                 c("extraembryonic endoderm","area opaca", "blood islands"))]
+que.expr = as.matrix(HH5_sub@assays$ATAC@data[all_peaks,que.cells])
+```
+
+For loop to retrieve max expression value for each gene
+```{r}
+peak_vals = c()
+for(peak in all_peaks) {
+  peak_vals = c(peak_vals, max(que.expr[c(peak),]))
+}
+head(peak_vals)
+```
+
+Make anterior/posterior accessibility matrix
+```{r}
+expr.1 = matrix(NA, nrow=length(all_peaks), ncol=1)
+rownames(expr.1) = all_peaks
+colnames(expr.1) = c("anterior")
+expr.1[1:length(anterior_peaks),] = peak_vals[1:length(anterior_peaks)]
+expr.1[(length(anterior_peaks)+1):nrow(expr.1),] = 0
+
+expr.2 = matrix(NA, nrow=length(all_peaks), ncol=1)
+rownames(expr.2) = all_peaks
+colnames(expr.2) = c("posterior")
+expr.2[1:length(anterior_peaks),] = 0
+expr.2[(length(anterior_peaks)+1):nrow(expr.2),] = peak_vals[1:length(posterior_peaks)]
+
+X = cbind(expr.1, expr.2)
+head(X)
+```
+
+Order cells from anterior to posterior
+```{r}
+identity.que = matrix(NA, nrow=ncol(que.expr), ncol=4)
+rownames(identity.que) <- colnames(que.expr)
+colnames(identity.que) <- c("frxn_ant", "frxn_post", "Lagrangian", "Error")
+
+for (j in seq(ncol(que.expr))){
+  Y <- as.matrix(que.expr[,j])
+  Rinv <- solve(chol(t(X) %*% X));
+  C <- cbind(rep(1,2), diag(2))
+  b <- c(1,rep(0,2))
+  d <- t(Y) %*% X  
+  QP<-solve.QP(Dmat = Rinv, factorized = TRUE, dvec = d, Amat = C, bvec = b, meq = 1)
+  Error<-sum(abs(Y-X%*%QP$solution))
+  identity.que[j,] <- c(QP$solution[1],QP$solution[2],QP$Lagrangian[1],Error)
+}
+
+Y <- as.matrix(que.expr[,1])
+Rinv <- solve(chol(t(X) %*% X))
+chol(t(X) %*% X)
+t(X) %*% X
+for (j in seq(ncol(que.expr))){
+  Y <- as.matrix(que.expr[,j])
+  Rinv <- solve(chol(t(X) %*% X));
+  C <- cbind(rep(1,2), diag(2))
+  b <- c(1,rep(0,2))
+  d <- t(Y) %*% X
+  QP<-solve.QP(Dmat = Rinv, factorized = TRUE, dvec = d, Amat = C, bvec = b, meq = 1)
+  Error<-sum(abs(Y-X%*%QP$solution))
+  identity.que[j,] <- c(QP$solution[1],QP$solution[2],QP$Lagrangian[1],Error)
+}
+
+identity.que = identity.que[order(identity.que[,1],decreasing=TRUE),]
+head(identity.que)
+col.order = rownames(identity.que)
+```
+
+Plot heatmaps of ant/post peaksets across ant-post axis
+```{r}
+expr.mat = as.matrix(HH5_sub@assays$ATAC@data[all_peaks,que.cells])
+sc.prop = identity.que[,"frxn_ant"] #6681 cells
+cell.num.per.bin = 50
+expr.by.pt.bin = getExprByPt(pt.vec=sc.prop, expr.mat=expr.mat, cell.num.per.bin=cell.num.per.bin)
+expr.by.pt.bin = as.data.frame(expr.by.pt.bin)
+head(expr.by.pt.bin)
+
+anterior_set = colMeans(expr.by.pt.bin[anterior_peaks,])
+posterior_set = colMeans(expr.by.pt.bin[posterior_peaks,])
+tmp = rbind(anterior_set,posterior_set)
+
+colors = colorRampPalette(c("#054D80", "#ffffff","#9D0041"))(100)
+pheatmap(tmp, cluster_cols=F, labels_col = "", color=colors, border_color = NA, 
+```
+
+Add germ layer to metadata
+```{r}
+HH5_sub@meta.data = mutate(HH5_sub@meta.data, germ_layer = 
+         case_when(str_detect(cluster_name, "mesoderm") ~ "mesoderm",
+                   str_detect(cluster_name, "ectoderm") ~ "ectoderm",
+                   cluster_name=="endoderm" ~ "endoderm",
+                   TRUE ~ "other"))
+HH5_sub@meta.data %>% group_by(germ_layer) %>% count()
+```
+
+
+Plot UMAPs colored by germ layer
+```{r}
+my_cols = c("#054D80", "#929292", "#929292", "#929292")
+p1 = DimPlot(HH5_sub, reduction="wnn.umap", repel = TRUE, pt.size=0.2, 
+        cols=alpha(my_cols,0.4),
+        group.by = "germ_layer")
+
+my_cols = c("#929292", "#EFC40D", "#929292", "#929292")
+p2 = DimPlot(HH5_sub, reduction="wnn.umap", repel = TRUE, pt.size=0.2, 
+        cols=alpha(my_cols,0.4),
+        group.by = "germ_layer")
+
+my_cols = c("#929292", "#929292", "#9D0041", "#929292")
+p3 = DimPlot(HH5_sub, reduction="wnn.umap", repel = TRUE, pt.size=0.2, 
+        cols=alpha(my_cols,0.4),
+        group.by = "germ_layer", label.box = FALSE)
+p1 | p2 | p3
+```
+
+Extract matrix of gene expression counts
+```{r}
+tmp = HH5_sub@meta.data
+tmp = tmp[order(tmp[,c("ATAC_rank")],decreasing=TRUE),]
+col.order = rownames(tmp)
+
+RNAmat = as.matrix(HH5_sub@assays$RNA@data)
+RNAmat = RNAmat[,col.order]
+```
+
+Run TradeSeq evaluateK
+```{r}
+library(tradeSeq)
+AP_percentile = c(1:ncol(RNAmat)/ncol(RNAmat))*100
+time = matrix(AP_percentile, nrow=ncol(RNAmat), ncol=1, byrow=FALSE)
+rownames(time) = colnames(RNAmat)
+time
+
+weights = matrix(0, nrow=ncol(RNAmat), ncol=1)
+weights[,1] = c(1:ncol(RNAmat)/ncol(RNAmat))
+weights
+
+icMat = evaluateK(counts = RNAmat, pseudotime=time, k = 3:10, verbose = T,
+                   cellWeights = weights, conditions = factor(tmp$germ_layer))
+```
+
+
+Run TradeSeq fitGAM
+```{r}
+gamList = fitGAM(as.matrix(RNAmat) , pseudotime=time, cellWeights=weights, 
+                 conditions = factor(tmp$germ_layer), nknots=5)
+```
+
+Find genes differentially expressed across lineage
+```{r}
+assoRes = associationTest(gamList)
+```
+
+```{r}
+ecto_genes = rownames(assoRes)[
+  which(p.adjust(assoRes$pvalue_lineage1_conditionectoderm, "fdr") <= 0.05)]
+endo_genes = rownames(assoRes)[
+  which(p.adjust(assoRes$pvalue_lineage1_conditionendoderm, "fdr") <= 0.05)]
+meso_genes = rownames(assoRes)[
+  which(p.adjust(assoRes$pvalue_lineage1_conditionmesoderm, "fdr") <= 0.05)]
+```
+
+
+Subclustering analysis
+```{r}
+HH5_ecto = subset(HH5_sub, germ_layer==c('ectoderm'))
+HH5_ecto
+```
+
+
+```{r}
+DefaultAssay(HH5_ecto) = "RNA"
+HH5_ecto = SCTransform(HH5_ecto, verbose = FALSE) %>% RunPCA() %>% RunUMAP(dims = 1:50, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+
+DefaultAssay(HH5_ecto) = "ATAC"
+HH5_ecto = RunTFIDF(HH5_ecto)
+HH5_ecto = FindTopFeatures(HH5_ecto, min.cutoff = 'q0')
+HH5_ecto = RunSVD(HH5_ecto)
+HH5_ecto = RunUMAP(HH5_ecto, reduction = 'lsi', dims = 2:50, reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+```
+
+
+```{r}
+HH5_ecto = FindMultiModalNeighbors(HH5_ecto, reduction.list=list("pca", "lsi"), 
+                                  dims.list = list(1:50, 2:50))
+HH5_ecto = RunUMAP(HH5_ecto, nn.name="weighted.nn", reduction.name="wnn.umap",
+                  reduction.key="wnnUMAP_")
+HH5_ecto = FindClusters(HH5_ecto, graph.name = "wsnn", algorithm = 3, verbose = FALSE)
+```
+
+plot peaksets onto UMAP
+```{r}
+DefaultAssay(HH5_ecto) = 'ATAC'
+features = list("anterior.peaks" = anterior_peaks, "posterior.peaks"=posterior_peaks)
+
+HH5_ecto_mod = AddChromatinModule(HH5_ecto, features,
+                   genome=BSgenome.Ggallus.ENSEMBL.galGal6)
+
+p1 = FeaturePlot(object=HH5_ecto_mod, features=c('anterior.peaks'), reduction="wnn.umap", 
+  min.cutoff='q10', max.cutoff='q90', repel = TRUE, pt.size=1) + scale_colour_gradientn(colours=c("gray75", "#054D80"))
+
+p2 = FeaturePlot(object=HH5_ecto_mod, features=c('posterior.peaks'), reduction="wnn.umap", 
+  min.cutoff='q10', max.cutoff='q90', repel = TRUE, pt.size=1) + scale_colour_gradientn(colours=c("gray75", "#9D0041"))
+
+p1 | p2
+```
+
+
+
+#Mesoderm
+```{r}
+HH5_meso = subset(HH5_sub, germ_layer==c('mesoderm'))
+HH5_meso
+```
+
+```{r}
+DefaultAssay(HH5_meso) = "RNA"
+HH5_meso = SCTransform(HH5_meso, verbose = FALSE) %>% RunPCA() %>% RunUMAP(dims = 1:50, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+
+DefaultAssay(HH5_meso) = "ATAC"
+HH5_meso <- RunTFIDF(HH5_meso)
+HH5_meso <- FindTopFeatures(HH5_meso, min.cutoff = 'q0')
+HH5_meso <- RunSVD(HH5_meso)
+HH5_meso <- RunUMAP(HH5_meso, reduction = 'lsi', dims = 2:50, reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+```
+
+```{r}
+HH5_meso = FindMultiModalNeighbors(HH5_meso, reduction.list=list("pca", "lsi"), 
+                                  dims.list = list(1:50, 2:50))
+HH5_meso = RunUMAP(HH5_meso, nn.name="weighted.nn", reduction.name="wnn.umap",
+                  reduction.key="wnnUMAP_")
+HH5_meso = FindClusters(HH5_meso, graph.name = "wsnn", algorithm = 3, verbose = FALSE)
+```
+
+plot peaksets onto UMAP
+```{r}
+DefaultAssay(HH5_meso) = 'ATAC'
+features = list("anterior.peaks" = anterior_peaks, "posterior.peaks"=posterior_peaks)
+
+HH5_meso_mod = AddChromatinModule(HH5_meso, features,
+                   genome=BSgenome.Ggallus.ENSEMBL.galGal6)
+
+p3 = FeaturePlot(object=HH5_meso_mod, features=c('anterior.peaks'), reduction="wnn.umap", 
+  min.cutoff='q10', max.cutoff='q90', repel = TRUE, pt.size=1) + scale_colour_gradientn(colours=c("gray75", "#054D80"))
+
+p4 = FeaturePlot(object=HH5_meso_mod, features=c('posterior.peaks'), reduction="wnn.umap", 
+  min.cutoff='q10', max.cutoff='q90', repel = TRUE, pt.size=1) + scale_colour_gradientn(colours=c("gray75", "#9D0041"))
+p3 | p4
+```
+
+
+
+Endoderm
+```{r}
+HH5_endo = subset(HH5_sub, germ_layer==c('endoderm'))
+HH5_endo
+```
+
+```{r}
+DefaultAssay(HH5_endo) = "RNA"
+HH5_endo = SCTransform(HH5_endo, verbose = FALSE) %>% RunPCA() %>% RunUMAP(dims = 1:50, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+
+DefaultAssay(HH5_endo) = "ATAC"
+HH5_endo <- RunTFIDF(HH5_endo)
+HH5_endo <- FindTopFeatures(HH5_endo, min.cutoff = 'q0')
+HH5_endo <- RunSVD(HH5_endo)
+HH5_endo <- RunUMAP(HH5_endo, reduction = 'lsi', dims = 2:50, reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+```
+
+
+```{r}
+HH5_endo = FindMultiModalNeighbors(HH5_endo, reduction.list=list("pca", "lsi"), 
+                                  dims.list = list(1:50, 2:50))
+HH5_endo = RunUMAP(HH5_endo, nn.name="weighted.nn", reduction.name="wnn.umap",
+                  reduction.key="wnnUMAP_")
+HH5_endo = FindClusters(HH5_endo, graph.name = "wsnn", algorithm = 3, verbose = FALSE)
+```
+
+plot peaksets onto UMAP
+```{r}
+DefaultAssay(HH5_endo) = 'ATAC'
+features = list("anterior.peaks" = anterior_peaks, "posterior.peaks"=posterior_peaks)
+
+HH5_endo_mod = AddChromatinModule(HH5_endo, features,
+                   genome=BSgenome.Ggallus.ENSEMBL.galGal6)
+
+p5 = FeaturePlot(object=HH5_endo_mod, features=c('anterior.peaks'), reduction="wnn.umap", 
+  min.cutoff='q10', max.cutoff='q90', repel = TRUE, pt.size=1) + scale_colour_gradientn(colours=c("gray75", "#054D80"))
+
+p6 = FeaturePlot(object=HH5_endo_mod, features=c('posterior.peaks'), reduction="wnn.umap", 
+  min.cutoff='q10', max.cutoff='q90', repel = TRUE, pt.size=1) + scale_colour_gradientn(colours=c("gray75", "#9D0041"))
+
+p5 | p6
+```
+
