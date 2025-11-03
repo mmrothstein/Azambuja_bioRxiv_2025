@@ -1,0 +1,503 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-10-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+load libraries
+```{r}
+library(tidyverse)
+library(zoo)
+library(pheatmap)
+library(data.table)
+library(reshape2)
+library(plyr)
+library(tradeSeq)
+library(ggpubr)
+library(ggfortify)
+library(plotly)
+library(RColorBrewer)
+library(pheatmap)
+library(biomaRt)
+```
+
+load raw counts table
+```{r}
+raw_counts = read.table("tomoSeq_raw_counts.txt", header = TRUE)
+raw_counts = raw_counts %>% dplyr::select(-starts_with("Tomo.seq_HH5_LR"))
+```
+
+Filter total counts for HH5 rep1 and rep2
+```{r}
+R1_counts = raw_counts %>% dplyr::select(Gene, starts_with("Tomo.seq_HH5_E1_AP")) %>% 
+  remove_rownames %>% column_to_rownames(var='Gene')
+oldnames = names(R1_counts)
+newnames = str_sub(names(R1_counts), 17,)
+R1_counts = R1_counts %>% rename_at(vars(oldnames), ~ newnames)
+R1_counts = R1_counts[order(as.numeric(str_sub(names(R1_counts), 3)))]
+colnames(R1_counts) = paste0('R1_', colnames(R1_counts))
+R1_counts
+
+R2_counts = raw_counts %>% dplyr::select(Gene, starts_with("Tomo.seq_HH5_E2_AP")) %>%
+  remove_rownames %>% column_to_rownames(var='Gene')
+oldnames = names(R2_counts)
+newnames = str_sub(names(R2_counts), 17,)
+R2_counts = R2_counts %>% rename_at(vars(oldnames), ~ newnames)
+R2_counts = R2_counts[order(as.numeric(str_sub(names(R2_counts), 3)))]
+colnames(R2_counts) = paste0('R2_', colnames(R2_counts))
+R2_counts
+```
+
+Remove spike-in reads from datasets
+```{r}
+counts_list = list(R1 = R1_counts, R2 = R2_counts)
+spike_counts = list()
+trimmed_counts = list()
+for (name in names(counts_list)) {
+  counts = counts_list[[name]]
+  spike_counts[[name]] = counts %>% filter(str_sub(row.names(counts), 1, 4) == "SIRV")
+  trimmed_counts[[name]] <- counts[1:24356, ]
+}
+R1_spike_counts = spike_counts$R1
+R2_spike_counts = spike_counts$R2
+R1_counts = trimmed_counts$R1
+R2_counts = trimmed_counts$R2
+```
+
+filter lowly expressed genes
+```{r}
+counts = cbind(R1_counts, R2_counts)
+counts = counts %>% dplyr::filter(rowSums(counts) > 50)
+counts
+```
+
+Set up vectors for TradeSeq
+```{r}
+R1_percentile = (c(1:46)/46)*100
+R2_percentile = (c(1:54)/54)*100
+time = c(R1_percentile, R2_percentile)
+time = matrix(time, nrow=ncol(counts), ncol=1, byrow=FALSE)
+rownames(time) = colnames(counts)
+
+weights = matrix(0, nrow=ncol(counts), ncol=1)
+weights[,1] = c(c(1:46/46, c(1:54)/54))
+```
+
+
+Omit R1 AP14
+```{r}
+counts = counts %>% dplyr::select(-R1_AP14)
+
+time = matrix(time[-14,])  
+rownames(time) <- colnames(counts)
+weights = matrix(weights[-14,])
+```
+
+evaluate optimal K
+```{r}
+infMat = evaluateK(as.matrix(counts), pseudotime=time, cellWeights=weights, k=3:10)
+```
+
+Run TradeSeq
+```{r}
+gamList = fitGAM(as.matrix(counts), pseudotime=time, cellWeights=weights, nknots=5)
+```
+
+Find genes differentially expressed across lineage
+```{r}
+assoRes = associationTest(gamList)
+oo = order(assoRes$pvalue, decreasing=FALSE)
+assoRes = assoRes[oo,]
+assoRes$geneID = rownames(assoRes)
+tmp = na.omit(assoRes) %>% dplyr::filter(pvalue <= 0.01) %>% dplyr::filter(meanLogFC > 0.5)
+deTradeSeq = tmp$geneID
+```
+
+Find anterior/posterior differentially expressed genes
+```{r}
+startTest = startVsEndTest(gamList, pseudotimeValues = c(20,99))
+oo = order(startTest$pvalue, decreasing=FALSE)
+startTest = startTest[oo,]
+startTest$geneID = rownames(startTest)
+tmp = na.omit(startTest) %>% dplyr::filter(pvalue <= 0.01)
+destartTest = tmp$geneID
+ant_genes = na.omit(startTest) %>% dplyr::filter(pvalue <= 0.01) %>% dplyr::filter(logFClineage1 <= -1)
+post_genes = na.omit(startTest) %>% dplyr::filter(pvalue <= 0.01) %>% dplyr::filter(logFClineage1 >= 1)
+write.table(startTest %>% mutate(anterior = geneID %in% ant_genes$geneID, posterior = geneID %in% post_genes$geneID),
+            file = "AntPost_DEG.txt")
+```
+
+Normalize counts for spike-in reads
+```{r}
+for (name in c("R1", "R2")) {
+  counts = get(paste0(name, "_counts"))
+  spike = get(paste0(name, "_spike_counts"))
+  norm_factor = colSums(spike) * 0.0001
+  counts = as.data.frame(t(t(counts) / norm_factor))
+  if (name == "R1") counts <- dplyr::select(counts, -R1_AP14)
+  assign(paste0(name, "_counts"), counts)
+}
+```
+
+Correlate R1 and R2
+```{r}
+RNA_cor = as.data.frame(cbind(rowSums(R1_counts),rowSums(R2_counts))) %>% dplyr::rename("R1"="V1", "R2"="V2")
+RNA_cor$gene = rownames(RNA_cor)
+RNA_cor_plot = ggplot(RNA_cor, aes(x=log(R1), y=log(R2))) + geom_point(color="gray60", alpha=0.3) +
+  theme_classic() + stat_cor(method = "pearson")
+RNA_cor_plot
+ggsave("/data/Megan/tomoAnalysis/tomoSeq/RNA_cor_plot.pdf", height = 4, width = 4)
+```
+
+Filter genes with row sums greater than or equal to 50
+```{r}
+R1_counts = R1_counts %>% dplyr::filter(rowSums(R1_counts) > 50)
+R2_counts = R2_counts %>% dplyr::filter(rowSums(R2_counts) > 50)
+```
+
+pca plot
+```{r}
+R1_counts$gene = row.names(R1_counts)
+R2_counts$gene = row.names(R2_counts)
+counts_comb = inner_join(R1_counts, R2_counts, by="gene")
+log_comp_counts = counts_comb %>%
+                melt(id.vars=c("gene"), variable.name='Sample', value.name='Count') %>%
+                mutate(logCount = log10(Count + .5)) %>%
+                dcast(Sample~gene, value.var='logCount') %>%
+                tibble::column_to_rownames("Sample")
+
+pca = prcomp(log_comp_counts, scale. = TRUE)
+x = as.data.frame(pca$x) %>% tibble::rownames_to_column("Sample") %>%
+    mutate(Replicate = as.numeric(substring(Sample, 2, 2))) %>%
+    mutate(SampleNo = as.numeric(substring(Sample, 6,7)))
+PC1_2 = ggplot(x, aes(x=PC1, y=PC2, color=SampleNo, group = as.factor(Replicate))) +
+  theme_classic() + geom_point(aes(shape = as.factor(Replicate)), size = 2.5)
+PC1_2
+PC1_3 = ggplot(x, aes(x=PC1, y=PC3, color=SampleNo, group = as.factor(Replicate))) +
+  theme_classic() + geom_point(aes(shape = as.factor(Replicate)), size = 2.5)
+PC1_3
+```
+
+
+Calculate Z-scores
+```{r}
+for (name in c("R1", "R2")) {
+  counts <- get(paste0(name, "_counts"))
+  counts$gene <- NULL
+  counts_Z = as.data.frame(t(scale(t(counts))))
+  assign(paste0(name, "_counts_Z"), counts_Z)
+}
+```
+
+calculate moving average of z-scores
+```{r}
+for (name in c("R1", "R2")) {
+  counts_Z = get(paste0(name, "_counts_Z"))
+  counts_Z$gene = NULL
+  mvav = rollapply(zoo(t(counts_Z)), 5, mean, fill = NA, partial = TRUE, by.column = TRUE) %>%
+    as.data.frame()
+  row.names(mvav) = row.names(t(counts_Z))
+  mvav = as.data.frame(t(mvav))
+  mvav$gene = row.names(mvav)
+  mvav_long = melt(mvav, id.vars = "gene")
+  assign(paste0(name, "_counts_mvav"), mvav)
+  assign(paste0(name, "_counts_mvav_long"), mvav_long)
+}
+```
+
+```{r}
+write.table(R1_counts_mvav, file = "R1_counts_mvav.txt")
+write.table(R2_counts_mvav, file = "R2_counts_mvav.txt")
+```
+
+
+cluster moving averages of z scores
+```{r}
+R1_counts_mvav$gene = NULL
+tmp = R1_counts_mvav[deTradeSeq,]
+tmp_dist = dist(na.omit(tmp))
+tmp_clust = hclust(tmp_dist)
+tmp_tree = as.data.frame(cutree(tmp_clust, k = 8))
+colnames(tmp_tree)[1] = "clust"
+tmp_tree$gene = row.names(tmp_tree)
+R1_counts_mvav$gene = row.names(R1_counts_mvav)
+R1_mvav_clusters = merge(tmp_tree, R1_counts_mvav, by = "gene")
+R1_mvav_clusters_tall = melt(R1_mvav_clusters, id.vars = c("gene", "clust"))
+R1_mvav_clusters_mean = ddply(R1_mvav_clusters_tall, c("clust", "variable"), summarise, mean=mean(value))
+
+R1_cluster_plot = ggplot(data=R1_mvav_clusters_tall, aes(x=variable, y=value, group=gene)) + 
+  theme_classic() +
+  geom_line(color = "gray", alpha=0.3) + 
+  scale_x_discrete(breaks = levels(R1_mvav_clusters_tall$variable)[c(T, rep(F,10))]) +
+  geom_line(data=R1_mvav_clusters_mean, aes(x=variable, y=mean, group=1), color="#2171B5") + 
+  facet_wrap(~clust, ncol = 4)
+R1_cluster_plot
+```
+
+Plot R1 and R2 in same plot
+```{r}
+R1_counts_mvav$R1_AP14 = NULL
+
+x=R1_counts_mvav
+x$gene = NULL
+R1_percentile = (c(1:45)/45)*100
+x = x %>% rename_at(vars(names(x)), ~ as.character(R1_percentile))
+x$gene = row.names(x)
+x_long = gather(x, "AP", "expression", -gene)
+
+y=R2_counts_mvav
+y$gene = NULL
+R2_percentile = (c(1:54)/54)*100
+y = y %>% rename_at(vars(names(y)), ~ as.character(R2_percentile))
+y$gene = row.names(y)
+y_long = gather(y, "AP", "expression", -gene)
+
+OTX2 = ggplot() + theme_classic() +
+  geom_line(data=filter(x_long, gene == 'ENSGALG00000034889'),
+            aes(x=as.numeric(AP), y=expression, group = gene), color ="#084594") +
+  geom_line(data=filter(y_long, gene == 'ENSGALG00000034889'),
+            aes(x=as.numeric(AP), y=expression, group = gene), color ="#4DB062") +
+  labs(x=c("anterior-posterior"))
+OTX2
+
+CHRD = ggplot() + theme_classic() +
+  geom_line(data=filter(x_long, gene == 'ENSGALG00000026983'),
+            aes(x=as.numeric(AP), y=expression, group = gene), color ="#084594") +
+  geom_line(data=filter(y_long, gene == 'ENSGALG00000026983'),
+            aes(x=as.numeric(AP), y=expression, group = gene), color ="#4DB062") +
+  labs(x=c("anterior-posterior"))
+CHRD
+
+MEOX1 = ggplot() + theme_classic() +
+  geom_line(data=filter(x_long, gene == 'ENSGALG00000001191'),
+            aes(x=as.numeric(AP), y=expression, group = gene), color ="#084594") +
+  geom_line(data=filter(y_long, gene == 'ENSGALG00000001191'),
+            aes(x=as.numeric(AP), y=expression, group = gene), color ="#4DB062") +
+  labs(x=c("anterior-posterior"))
+MEOX1
+
+WNT5A = ggplot() + theme_classic() +
+  geom_line(data=filter(x_long, gene == 'ENSGALG00000034168'),
+            aes(x=as.numeric(AP), y=expression, group = gene), color ="#084594") +
+  geom_line(data=filter(y_long, gene == 'ENSGALG00000034168'),
+            aes(x=as.numeric(AP), y=expression, group = gene), color ="#4DB062") +
+  labs(x=c("anterior-posterior"))
+WNT5A
+
+CDX4 = ggplot() + theme_classic() +
+  geom_line(data=filter(x_long, gene == 'ENSGALG00000007657'),
+            aes(x=as.numeric(AP), y=expression, group = gene), color ="#084594") +
+  geom_line(data=filter(y_long, gene == 'ENSGALG00000007657'),
+            aes(x=as.numeric(AP), y=expression, group = gene), color ="#4DB062") +
+  labs(x=c("anterior-posterior"))
+CDX4
+
+TBXT = ggplot() + theme_classic() +
+  geom_line(data=filter(x_long, gene == 'ENSGALG00000011489'),
+            aes(x=as.numeric(AP), y=expression, group = gene), color ="#084594") +
+  geom_line(data=filter(y_long, gene == 'ENSGALG00000011489'),
+            aes(x=as.numeric(AP), y=expression, group = gene), color ="#4DB062") +
+  labs(x=c("anterior-posterior"))
+TBXT
+```
+
+Load chicken gene names
+```{r}
+ensembl = biomaRt::useEnsembl(biomart = "genes", dataset = "ggallus_gene_ensembl", version = "101")
+chick_BM = getBM(attributes = c('ensembl_gene_id', 'external_gene_name'), mart = ensembl)
+chick_BM
+```
+
+Heatmap of anterior/posterior-enriched genes
+```{r}
+col.pal = colorRampPalette(c("#878787","#BABABA", "#E0E0E0", "#F7FBFF","#C6DBEF", "#9ECAE1", "#6BAED6", "#4292C6", "#2171B5", "#08519C"))(100)
+
+R1_counts_mvav = inner_join(R1_counts_mvav, unique(chick_BM), by=c("gene"="ensembl_gene_id"))
+R1_counts_mvav = R1_counts_mvav %>% mutate(tmp = ifelse(external_gene_name=="", gene,
+                        ifelse(external_gene_name!="", external_gene_name, 'none')))
+R1_counts_mvav = R1_counts_mvav %>% distinct(tmp, .keep_all = TRUE) %>%
+  column_to_rownames(var="tmp") %>% dplyr::select(-gene, -external_gene_name)
+
+ant_genes = inner_join(ant_genes, unique(chick_BM), by=c("geneID"="ensembl_gene_id"))
+ant_genes = ant_genes %>% mutate(tmp = ifelse(external_gene_name=="", geneID,
+                        ifelse(external_gene_name!="", external_gene_name, 'none')))
+post_genes = inner_join(post_genes, unique(chick_BM), by=c("geneID"="ensembl_gene_id"))
+post_genes = post_genes %>% mutate(tmp = ifelse(external_gene_name=="", geneID,
+                        ifelse(external_gene_name!="", external_gene_name, 'none')))
+
+labels = c('SIX3','OTX2','OTX1','CHRD','SFRP1','EYA2','SHISA2','IRX1','PAX7','DLX6', 'OLIG2', 'SIX1', 'CYP26A1','IRX6', 'MYCN', 'DLX2', 'BMP5', 'SOX3', 'GSC', 'EOMES')
+pheatmap(R1_counts_mvav %>% dplyr::filter(rownames(R1_counts_mvav) %in% ant_genes$tmp), cluster_cols=FALSE, border_color=NA, color=col.pal, labels_row = labels, width=7, height=7)
+
+labels = c('HOXD4','CDX2','MESP1','CXCL14','FLI1','LMO2','TCF7','TBXT','WNT5A', 'HOXA1', 'CDH5',
+           'HOXA10', 'HOXA6','HOXA7', 'HOXB4', 'TBX6', 'HOXB2', 'ZEB2', 'ZEB1', 'RARA')
+pheatmap(R1_counts_mvav %>% dplyr::filter(rownames(R1_counts_mvav) %in% post_genes$tmp), cluster_cols=FALSE, border_color=NA, color=col.pal, labels_row = labels, width=7, height=4)
+```
+
+GO term analysis
+```{r}
+anterior_GO = read.table("GO_terms_anterior.txt", sep="\t", header = T)
+anterior_GO = anterior_GO %>% dplyr::select("GO_term"="GO.biological.process.complete", "Fold_enrichment"="Client.Text.Box.Input..fold.Enrichment.", 
+                              "P_value"="Client.Text.Box.Input..P.value.")
+anterior_GO = anterior_GO %>% separate(GO_term, c("GO_term", "ID"), sep="[(]")
+
+posterior_GO = read.table("GO_terms_posterior.txt", sep="\t", header = T)
+posterior_GO = posterior_GO %>% dplyr::select("GO_term"="GO.biological.process.complete", "Fold_enrichment"="Client.Text.Box.Input..fold.Enrichment.", 
+                              "P_value"="Client.Text.Box.Input..P.value.")
+posterior_GO = posterior_GO %>% separate(GO_term, c("GO_term", "ID"), sep="[(]")
+
+anterior_GO = anterior_GO %>% arrange(desc(Fold_enrichment))
+posterior_GO = posterior_GO %>% arrange(desc(Fold_enrichment))
+
+GO_plot_ant = ggplot(anterior_GO, aes(x=1, y=GO_term, color=P_value, size=Fold_enrichment)) + 
+  geom_point() + theme_classic() + scale_colour_distiller(palette="Blues")
+GO_plot_ant
+
+GO_plot_post = ggplot(posterior_GO, aes(x=1, y=GO_term, color=P_value, size=Fold_enrichment)) + 
+  geom_point() + theme_classic() + scale_colour_distiller(palette="Greens")
+GO_plot_post
+```
+
+Plot genes
+```{r}
+R1_counts_mvav$gene = row.names(R1_counts_mvav)
+R1_counts_mvav_long = melt(R1_counts_mvav, id.vars = "gene")
+
+gene_list = c("OTX2", "MEOX1", "TBXT")
+gene_ids = filter(unique(chick_BM), external_gene_name %in% gene_list)$ensembl_gene_id
+gene_names = filter(unique(chick_BM), external_gene_name %in% gene_list)$external_gene_name
+names(gene_names) = gene_ids
+
+x=dplyr::filter(R1_counts_mvav_long, gene %in% gene_names)
+x$gene = factor(x$gene, levels = gene_names)
+x = x %>% mutate(variable = as.numeric(substr(variable,6,7)))
+p1 = ggplot(data = x, aes(x=variable, y=value, group=gene, color=gene)) + 
+  geom_line() + theme_classic() + xlab(NULL) + ylab('counts') +
+  geom_ribbon(aes(ymin=-Inf, ymax=value, fill=gene), alpha =0.7) +
+  scale_color_manual(values = c("#AC0574","#1AA147","#106FAF")) +
+  scale_fill_manual(values = c("#AC0574","#1AA147","#106FAF")) +
+  coord_flip() + scale_x_reverse()
+p1
+```
+
+
+load raw counts table
+```{r}
+raw_counts = read.table("tomoSeq_raw_counts.txt", header = TRUE)
+HH5_E1 = dplyr::select(raw_counts, Gene, starts_with("Tomo.seq_HH5_LR") |
+                         starts_with("Tomo.seq_HH5_E1")) %>% 
+  remove_rownames %>% column_to_rownames(var='Gene')
+names(HH5_E1) = sub("Tomo\\.seq_HH5_LR_0*", "LR", sub("Tomo\\.seq_HH5_E1_AP", "AP", names(HH5_E1)))
+```
+
+make vector of spike in gene names
+```{r}
+spike_counts = HH5_E1 %>% filter(str_sub(row.names(HH5_E1), 1,4) == "SIRV")
+spike_counts
+
+R1_spike = as.data.frame(colSums(spike_counts)) %>% dplyr::rename("spike_counts"="colSums(spike_counts)")
+R1_spike$level = rownames(R1_spike)
+R1_spike
+```
+
+Remove spike-in reads from datasets
+```{r}
+spike_counts = HH5_E1 %>% filter(str_sub(row.names(HH5_E1), 1,4) == "SIRV")
+R1_spike = as.data.frame(colSums(spike_counts)) %>% dplyr::rename("spike_counts"="colSums(spike_counts)")
+HH5_E1 = HH5_E1[1:24356,]
+```
+
+Normalize counts for spike-in reads
+```{r}
+norm_factor = colSums(spike_counts)
+norm_factor = norm_factor * 0.0001
+HH5_E1 = as.data.frame(t(t(HH5_E1)/norm_factor))
+```
+
+
+```{r}
+HH5_E1 = HH5_E1 %>% dplyr::select(-AP14)
+HH5_E1
+```
+
+Filter genes with row sums greater than or equal to 20
+```{r}
+HH5_E1 = HH5_E1 %>% dplyr::filter(rowSums(HH5_E1) > 20)
+HH5_E1
+```
+
+calculate moving average of raw counts
+```{r}
+HH5_E1_AP = dplyr::select(HH5_E1, starts_with("AP"))
+HH5_E1_LR = dplyr::select(HH5_E1, starts_with("LR"))
+
+HH5_E1_AP_mvav = as.data.frame(rollapply(zoo(t(HH5_E1_AP)), 5, mean, fill = NA, 
+                                         partial = TRUE, by.column = TRUE))
+row.names(HH5_E1_AP_mvav) = row.names(t(HH5_E1_AP))
+HH5_E1_AP_mvav = as.data.frame(t(HH5_E1_AP_mvav))
+
+HH5_E1_LR_mvav = as.data.frame(rollapply(zoo(t(HH5_E1_LR)), 5, mean, fill = NA, 
+                                         partial = TRUE, by.column = TRUE))
+row.names(HH5_E1_LR_mvav) = row.names(t(HH5_E1_LR))
+HH5_E1_LR_mvav = as.data.frame(t(HH5_E1_LR_mvav))
+```
+
+
+Plot OTX2, CHRD, MEOX1, and TBXT
+```{r}
+library(gridExtra)
+genes = c("ENSGALG00000034889","ENSGALG00000026983","ENSGALG00000001191","ENSGALG00000011489")
+p = list()
+for (gene in genes){
+  AP = filter(HH5_E1_AP_mvav, rownames(HH5_E1_AP) == gene)
+  LR = filter(HH5_E1_LR_mvav, rownames(HH5_E1_LR) == gene)
+  DF = matrix(unlist(AP)) %*% matrix(unlist(LR), nrow = 1)
+  x = DF %>% as_tibble() %>% rowid_to_column(var="AP") %>% 
+    gather(key="LR", value="val", -1) %>% mutate(LR=as.numeric(gsub("V","",LR)))
+  p[[gene]] = ggplot(x, aes(AP, LR, fill= val)) + geom_tile() + 
+    scale_fill_gradient(low="white", high = "slateblue4") + theme_classic() +
+    coord_flip() + scale_x_reverse() +
+  labs(y="Left-Right", x="Posterior-Anterior", title=gene)
+}
+do.call(grid.arrange,p)
+```
+
+Heatmap of average expression patterns
+```{r}
+col.pal = colorRampPalette(c("#878787","#BABABA", "#E0E0E0", "#F7FBFF","#C6DBEF", "#9ECAE1", "#6BAED6", "#4292C6", "#2171B5", "#08519C"))(100)
+genes = post_genes$geneID
+AP = filter(HH5_E1_AP_mvav, rownames(HH5_E1_AP) %in% genes) %>% colMeans()
+LR = filter(HH5_E1_LR_mvav, rownames(HH5_E1_AP) %in% genes) %>% colMeans()
+DF = matrix(unlist(AP)) %*% matrix(unlist(LR), nrow = 1)
+x = DF %>% as_tibble() %>% rowid_to_column(var="AP") %>% 
+  gather(key="LR", value="val", -1) %>% mutate(LR=as.numeric(gsub("V","",LR)))
+post_genes_2D = ggplot(x, aes(AP, LR, fill= val)) + geom_tile() + 
+  theme_classic() +
+  scale_fill_gradientn(colors= col.pal) + theme_classic() +
+  coord_flip() + scale_x_reverse() + 
+  labs(y="Left-Right", x="Posterior-Anterior")
+post_genes_2D
+
+genes = ant_genes$geneID
+AP = filter(HH5_E1_AP_mvav, rownames(HH5_E1_AP) %in% genes) %>% colMeans()
+LR = filter(HH5_E1_LR_mvav, rownames(HH5_E1_AP) %in% genes) %>% colMeans()
+DF = matrix(unlist(AP)) %*% matrix(unlist(LR), nrow = 1)
+x = DF %>% as_tibble() %>% rowid_to_column(var="AP") %>% 
+  gather(key="LR", value="val", -1) %>% mutate(LR=as.numeric(gsub("V","",LR)))
+ant_genes_2D = ggplot(x, aes(AP, LR, fill= val)) + geom_tile() + 
+    scale_fill_gradientn(colors= col.pal) + theme_classic() +
+    coord_flip() + scale_x_reverse() + 
+  labs(y="Left-Right", x="Posterior-Anterior")
+ant_genes_2D
+```
+
+
+
+
+
+
+
+
