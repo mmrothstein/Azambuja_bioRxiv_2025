@@ -1,0 +1,135 @@
+
+SAMPLES = ["HH5_ATAC_AP1", "HH5_ATAC_AP2", "HH5_ATAC_AP3", "HH5_ATAC_AP4", "HH5_ATAC_AP5", "HH5_ATAC_AP6", "HH5_ATAC_AP7"]
+
+rule all:
+	input:
+		expand("fastq/{sample}_R1_fastqc.html", sample=SAMPLES),
+		expand("trimmed_fastq/trimmed_{sample}_R1.fastq.gz", sample=SAMPLES),
+		expand("trimmed_fastq/trimmed_{sample}_R2.fastq.gz", sample=SAMPLES),
+		expand("logs/cutadapt/{sample}.log", sample=SAMPLES),
+		expand("bam/galGal6/{sample}_galGal6.bam", sample=SAMPLES),
+		expand("bam/galGal6/{sample}_galGal6.bam.bai", sample=SAMPLES),
+		expand("bam/galGal6/dupsMarked/{sample}_galGal6_dupsMarked.bam", sample=SAMPLES),
+		expand("peaks/{sample}_peaks.narrowPeak", sample=SAMPLES),
+		expand("bw/{sample}_galGal6.bw", sample=SAMPLES),
+		expand("bam/galGal6/nodups/{sample}_galGal6_nodups.bam", sample=SAMPLES),
+		expand("bam/galGal6/nodups/{sample}_galGal6_nodups.bam.bai", sample=SAMPLES)
+
+
+rule fastqc:
+	input:
+		R1="fastq/{sample}_R1.fastq.gz",
+		R2="fastq/{sample}_R2.fastq.gz"
+	output:
+		R1="fastq/{sample}_R1_fastqc.html",
+		R2="fastq/{sample}_R2_fastqc.html"
+	threads: 8
+	shell:
+		"fastqc {input} -t {threads}"
+
+
+rule cutadapt:
+	input:
+		R1="fastq/{sample}_R1.fastq.gz",
+		R2="fastq/{sample}_R2.fastq.gz"
+	output:
+		R1="trimmed_fastq/trimmed_{sample}_R1.fastq.gz",
+		R2="trimmed_fastq/trimmed_{sample}_R2.fastq.gz"
+	log:
+		"logs/cutadapt/{sample}.log"
+	threads: 8
+	shell:
+		"cutadapt -a CTGTCTCTTATACACATCT \
+		-A AGATGTGTATAAGAGACAG \
+		--minimum-length=25 \
+		--cores={threads} \
+		{input.R1} \
+		{input.R2} \
+		-o {output.R1} \
+		-p {output.R2} 2> {log}"
+
+
+rule galGal6_bowtie2:
+	input:
+		R1="trimmed_fastq/trimmed_{sample}_R1.fastq.gz",
+		R2="trimmed_fastq/trimmed_{sample}_R2.fastq.gz"
+	output:
+		bam="bam/galGal6/{sample}_galGal6.bam"
+	log:
+		"logs/bowtie2/{sample}_galGal6.log"
+	threads: 16
+	shell:
+		"bowtie2 --local --very-sensitive-local \
+		--no-unal --no-mixed --no-discordant \
+		-x /data/Megan/genome_data/gallus_gallus/galGal6_ensembl_bt2/galGal6_ens_bt2 \
+		-X 2000 \
+		-1 {input.R1} \
+		-2 {input.R2} \
+		--threads {threads} \
+		2> {log} | samtools view -F 780 -f 2 -bh - | samtools sort -T {wildcards.sample}_galGal6 - -o {output.bam}"
+
+
+rule index_galGal6:
+	input:
+		"bam/{sample}_galGal6.bam"
+	output:
+		"bam/{sample}_galGal6.bam.bai"
+	shell:
+		"samtools index {input}"
+
+
+rule markDups:
+	input:
+		bam="bam/galGal6/{sample}_galGal6.bam", 
+		bai="bam/galGal6/{sample}_galGal6.bam.bai"
+	output:
+		bam="bam/galGal6/dupsMarked/{sample}_galGal6_dupsMarked.bam",
+		txt="bam/galGal6/dupsMarked/{sample}_dupsMarkedStats.txt"
+	shell:
+		"java -jar /opt/picard/picard.jar MarkDuplicates \
+		I= {input.bam}\
+		O= {output.bam}\
+		M= {output.txt}"
+
+rule RmDups:
+	input:
+		"bam/galGal6/dupsMarked/{sample}_galGal6_dupsMarked.bam"
+	output:
+		"bam/galGal6/nodups/{sample}_galGal6_nodups.bam"
+	shell:
+		"samtools view -F 1804 -f 2 -b {input} | samtools sort > {output}"
+
+rule index_nodups:
+	input:
+		"bam/galGal6/nodups/{sample}_galGal6_nodups.bam"
+	output:
+		"bam/galGal6/nodups/{sample}_galGal6_nodups.bam.bai"
+	shell:
+		"samtools index {input}"
+
+rule callpeak:
+	input:
+		"bam/galGal6/nodups/{sample}_galGal6_nodups.bam"
+	output:
+		"peaks/{sample}_peaks.narrowPeak"
+	log:
+		"logs/macs2/{sample}.log"
+	shell:
+		"macs2 callpeak -t {input} -n {wildcards.sample} -f BAMPE -g 1e9 -q 0.05 --call-summits --outdir ./peaks 2> {log}"
+
+
+rule bamCoverage:
+	input:
+		bam="bam/galGal6/nodups/{sample}_galGal6_nodups.bam",
+		bai="bam/galGal6/nodups/{sample}_galGal6_nodups.bam.bai"
+	output:
+		"bw/{sample}_galGal6.bw"
+	threads: 8
+	shell:
+		"bamCoverage --bam {input.bam} \
+		--outFileName {output} \
+		--outFileFormat bigwig \
+		--binSize 5 \
+		--numberOfProcessors {threads} \
+		--normalizeUsing RPKM \
+		--extendReads"

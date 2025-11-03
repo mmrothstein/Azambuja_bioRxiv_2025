@@ -1,0 +1,347 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-10-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+load dependencies
+```{r Loading libraries, include=FALSE}
+library(tidyverse)
+library(GenomicRanges)
+library(DiffBind)
+library(Rsubread)
+library(reshape2)
+library(zoo)
+library(plyr)
+library(pheatmap)
+library(JASPAR2020)
+library(BSgenome.Ggallus.ENSEMBL.galGal6)
+library(TFBSTools)
+library(chromVAR)
+library(tradeSeq)
+library(org.Gg.eg.db)
+library(ATACseqQC)
+library(GenomicFeatures)
+library(biomaRt)
+library(ggrepel)
+```
+
+load data
+```{r}
+HH5_peaks = dba(sampleSheet="tomoATAC_samples.csv")
+HH5_peaks
+```
+
+Count reads at peaks
+```{r}
+peaks.gr = read.table("HH5_scATACseq_peaks.bed") %>%
+  dplyr::rename("CHR"="V1", "START"="V2", "END"="V3") %>% GRanges()
+peakwidths = width(peaks.gr)
+peaks.gr = peaks.gr[peakwidths<5000 & peakwidths>150]
+HH5_peaks_2 = dba.count(HH5_peaks,
+                peaks=peaks.gr,
+                summits = FALSE, score=DBA_SCORE_NORMALIZED, bParallel=T)
+HH5_peaks_norm = dba.normalize(HH5_peaks_2, normalize=DBA_NORM_LIB,
+                             library=DBA_LIBSIZE_FULL)
+HH5_counts = dba.peakset(HH5_peaks_norm, bRetrieve=T, DataType=DBA_DATA_FRAME)
+HH5_counts
+```
+
+Filter for row sums greater than 100
+```{r}
+HH5_counts$peak = NULL
+keep = rowSums(HH5_counts) >= 100
+HH5_counts = HH5_counts[keep,,]
+```
+
+Set up vectors for TradeSeq
+```{r}
+time = as.numeric(sub("HH5_AP", "", colnames(HH5_counts)))
+time = matrix(time, nrow=ncol(HH5_counts), ncol=1, byrow=FALSE)
+rownames(time) <- colnames(HH5_counts)
+time
+weights = matrix(0, nrow=ncol(HH5_counts), ncol=1)
+weights[,1] = c(c(1:7/7))
+weights
+```
+
+evaluate optimal K
+```{r}
+infMat = evaluateK(as.matrix(HH5_counts), pseudotime=time, cellWeights=weights, k=3:7)
+```
+
+Run TradeSeq
+```{r}
+gamList = fitGAM(as.matrix(HH5_counts), pseudotime=time, cellWeights=weights, nknots=4)
+```
+
+Find peaks differentially accessible across lineage
+```{r}
+assoRes = associationTest(gamList)
+oo <- order(assoRes$pvalue, decreasing=FALSE)
+assoRes = assoRes[oo,]
+assoRes$peak = rownames(assoRes)
+tmp = na.omit(assoRes) %>% dplyr::filter(pvalue <= 0.01) %>% dplyr::filter(meanLogFC > 0.5)
+deTradeSeq = tmp$peak
+```
+
+Find anterior/posterior differentially accessible peaks
+```{r}
+startTest = startVsEndTest(gamList, pseudotimeValues = c(1,7))
+oo = order(startTest$pvalue, decreasing=FALSE)
+startTest = startTest[oo,]
+startTest$peak = rownames(startTest)
+tmp = na.omit(startTest) %>% dplyr::filter(pvalue <= 0.01)
+destartTest = tmp$peak
+posterior_peaks = na.omit(startTest) %>% dplyr::filter(pvalue <= 0.01) %>% dplyr::filter(logFClineage1 >= 1)
+anterior_peaks = na.omit(startTest) %>% dplyr::filter(pvalue <= 0.01) %>% dplyr::filter(logFClineage1 <= -1)
+```
+
+Calculate z scores for counts
+```{r}
+HH5_counts_Z = as.data.frame(t(scale(t(HH5_counts))))
+```
+
+Calculate moving averages of z-scores
+```{r}
+HH5_counts_Z$peak = NULL
+HH5_counts_mvav = as.data.frame(rollapply(zoo(t(HH5_counts_Z)), 3, mean, fill = NA, partial = TRUE, by.column = TRUE))
+row.names(HH5_counts_mvav) = row.names(t(HH5_counts_Z))
+HH5_counts_mvav = as.data.frame(t(HH5_counts_mvav))
+```
+
+cluster moving average z-scores
+```{r}
+HH5_counts_mvav$peak = rownames(HH5_counts_mvav)
+HH5_counts_mvav_filt = dplyr::filter(HH5_counts_mvav, peak %in% deTradeSeq)
+HH5_counts_mvav_filt$peak = NULL
+HH5_counts_mvav_dist = dist(HH5_counts_mvav_filt)
+HH5_counts_mvav_clust = hclust(HH5_counts_mvav_dist, method = "complete")
+HH5_counts_mvav_tree = as.data.frame(cutree(HH5_counts_mvav_clust, k = 6))
+colnames(HH5_counts_mvav_tree)[1] = "clust"
+HH5_counts_mvav_tree$peak = row.names(HH5_counts_mvav_tree)
+HH5_counts_mvav_tree$peak = NULL
+HH5_counts_mvav_clusters = merge(HH5_counts_mvav_tree, HH5_counts_mvav_filt, by = "row.names")
+HH5_counts_mvav_clusters_tall = melt(HH5_counts_mvav_clusters, id.vars = c("Row.names", "clust"))
+HH5_counts_mvav_clusters_mean = ddply(HH5_counts_mvav_clusters_tall, c("clust", "variable"), summarise, mean=mean(value))
+
+ATAC_cluster_plot = ggplot(data=HH5_counts_mvav_clusters_tall, aes(x=variable, y=value, group=Row.names)) +
+  geom_line(color = "gray", alpha = 0.2) + theme_classic() +
+  geom_line(data=HH5_counts_mvav_clusters_mean, aes(x=variable, y=mean, group=1), color="#2171B5") +
+  facet_wrap(~clust, ncol = 3)
+ATAC_cluster_plot
+```
+
+plot line plots of anterior/posterior peaks
+```{r}
+HH5_counts_mvav_filt = dplyr::filter(HH5_counts_mvav, peak %in% anterior_peaks$peak)
+HH5_counts_mvav_clusters_tall = melt(HH5_counts_mvav_filt, id.vars = c("peak"))
+HH5_counts_mvav_clusters_mean = ddply(HH5_counts_mvav_clusters_tall,
+                                      c("variable"), summarise, mean=mean(value))
+ant_line_plot = ggplot(data=HH5_counts_mvav_clusters_tall, aes(x=variable, y=value, group=peak)) +
+  geom_line(color = "gray", alpha = 0.2) + theme_classic() +
+  geom_line(data=HH5_counts_mvav_clusters_mean, aes(x=variable, y=mean, group=1), color="#054D80")
+ant_line_plot
+
+HH5_counts_mvav_filt = dplyr::filter(HH5_counts_mvav, peak %in% posterior_peaks$peak)
+HH5_counts_mvav_clusters_tall = melt(HH5_counts_mvav_filt, id.vars = c("peak"))
+HH5_counts_mvav_clusters_mean = ddply(HH5_counts_mvav_clusters_tall,
+                                      c("variable"), summarise, mean=mean(value))
+post_line_plot = ggplot(data=HH5_counts_mvav_clusters_tall, aes(x=variable, y=value, group=peak)) +
+  geom_line(color = "gray", alpha = 0.2) + theme_classic() +
+  geom_line(data=HH5_counts_mvav_clusters_mean, aes(x=variable, y=mean, group=1), color="#9D0041")
+post_line_plot
+```
+
+Load chicken gene names
+```{r}
+ensembl = biomaRt::useEnsembl(biomart = "genes", dataset = "ggallus_gene_ensembl", version = "101")
+chick_BM = getBM(attributes = c('ensembl_gene_id', 'external_gene_name'), mart = ensembl)
+chick_BM
+```
+
+
+
+Heatmaps of anterior/posterior peaksets
+```{r}
+anterior_heat = HH5_counts_mvav %>% dplyr::filter(peak %in% anterior_peaks$peak[anterior_peaks$peak %in% deTradeSeq]) %>%
+  dplyr::select(-peak)
+posterior_heat = HH5_counts_mvav %>% dplyr::filter(peak %in% posterior_peaks$peak[posterior_peaks$peak %in% deTradeSeq]) %>%
+  dplyr::select(-peak)
+
+col.pal = colorRampPalette(c("#878787", "#E0E0E0", "#f1f9ff", "#64b1e5", "#004D80"))(100)
+pheatmap(anterior_heat,
+         cluster_cols=FALSE, border_color=NA, color=col.pal, labels_row = F,
+         cellwidth = 15, labels_col = c(1,2,3,4,5,6,7), width=5, height=6)
+pheatmap(posterior_heat,
+         cluster_cols=FALSE, border_color=NA, color=col.pal, labels_row = F,
+         cellwidth = 15, labels_col = c(1,2,3,4,5,6,7), width=5, height=6)
+```
+
+
+Chromvar analysis
+```{r}
+library(motifmatchr)
+library(BiocParallel)
+register(BPPARAM = MulticoreParam(workers = 32, progressbar = TRUE))
+var_obj = dba(HH5_peaks_4, bSummarizedExperiment = T)
+names(var_obj@assays) <- c("scores", "RPKM", "counts","cRPKM","cReads")
+var_obj = addGCBias(var_obj, genome=BSgenome.Ggallus.ENSEMBL.galGal6)
+opts = list()
+opts["tax_group"] <- "vertebrates"
+opts["collection"] <- "CORE"
+motifs = getMatrixSet(JASPAR2020, opts = opts)
+motif_ix = matchMotifs(motifs, var_obj, genome=BSgenome.Ggallus.ENSEMBL.galGal6)
+dev = computeDeviations(var_obj, motif_ix)
+dev@NAMES = paste0(dev@NAMES,"_",TFBSTools::name(motifs))
+variability = computeVariability(dev)
+AP_motif=as.data.frame(dev@assays@data$z)
+AP_motif$motif = rownames(AP_motif)
+motif_var=rownames_to_column(variability, var = "motif")
+motif_var=mutate(motif_var, motif=substr(motif_var$motif, 1,8))
+chromVar_motifs = inner_join(AP_motif, motif_var, by=c('motif'))
+chromVar_motifs= column_to_rownames(chromVar_motifs, var = 'name')
+chromVar_motifs = chromVar_motifs[,1:7]
+vars = filter(motif_var, variability > 10)$name
+
+col.pal = colorRampPalette(c("#878787","#BABABA", "#E0E0E0", "#F7FBFF","#C6DBEF", "#9ECAE1", "#6BAED6", "#4292C6", "#2171B5", "#08519C"))(100)
+
+pheatmap(chromVar_motifs %>% filter(rownames(chromVar_motifs) %in% vars),
+         cluster_rows = T, cluster_cols = F, border_color=NA, width=6, height = 15,
+         cellwidth = 25, cellheight=10, scale = "row", color=col.pal)
+```
+
+
+Extract TSSs from gene annotation
+```{r}
+library(rtracklayer)
+gtfRanges = import("Gallus_gallus.GRCg6a.99.gtf")
+gtfRanges = gtfRanges[gtfRanges$type %in% "transcript"]
+TSS = ifelse(strand(gtfRanges ) == "+", start(gtfRanges), end(gtfRanges))
+TSS = GRanges(seqnames(gtfRanges), IRanges(TSS+1, width=1), strand(gtfRanges))
+mcols(TSS) <- mcols(gtfRanges)
+TSS = TSS[!duplicated(TSS$gene_id)]
+mcols(TSS) = mcols(TSS)[,c("gene_id","gene_name")]
+TSS
+```
+
+Gene enrichment test
+```{r}
+#Assign CREs to closest TSS
+peaks.gr = read.table("HH5_scATACseq_peaks.bed", col.names = c("CHR", "START", "END")) %>%
+  GRanges() %>%
+  { .[width(.) > 150 & width(.) < 5000] }
+nearest_idx = nearest(peaks.gr, TSS)
+all_regions = peaks.gr[!is.na(nearest_idx)]
+nearest_idx = nearest_idx[!is.na(nearest_idx)]
+all_regions = cbind(
+  as.data.frame(all_regions),
+  as.data.frame(TSS[nearest_idx])
+)[, c(1:3, 11)]
+
+#Assign graded CREs to closest TSS
+process_peaks = function(df) {
+  df %>%
+    separate(peak, c("CHR", "Range"), ":") %>%
+    separate(Range, c("START", "END"), "-") %>%
+    mutate(
+      START = as.integer(START),
+      END   = as.integer(END),
+      graded = "YES")}
+graded <- bind_rows(process_peaks(anterior_peaks),process_peaks(posterior_peaks))
+query = all_regions %>%
+  left_join(graded, by = c("seqnames" = "CHR", "start" = "START", "end" = "END")) %>%
+  mutate(graded = ifelse(is.na(graded), "FALSE", "TRUE"))
+
+gene_res = query %>% group_by(gene_id) %>% 
+  dplyr::count(graded) %>% spread(graded, n, fill=0, drop=FALSE, sep="_")
+gene_res = gene_res %>% mutate(total = graded_TRUE + graded_FALSE)
+AntPost_DEG = read.table("AntPost_DEG.txt") %>% dplyr::filter(anterior == TRUE | posterior == TRUE)
+gene_res = gene_res %>% mutate(AP = case_when(gene_id %in% AntPost_DEG$geneID ~ TRUE,
+                                   .default = FALSE)) %>% mutate(id= 1:nrow(gene_res)) 
+
+graded_count = sum(gene_res$graded_TRUE)
+total = sum(gene_res$total)
+success_prob = (graded_count)/total
+data_binom = as.data.frame(gene_res) %>% dplyr::select(graded_TRUE, total, id) %>% dplyr::rename("count" = "graded_TRUE")
+
+function_PV = function(t)
+{
+  binom.test(x = t[1],
+             n = t[2],
+             p = (as.numeric(success_prob)),
+             alternative = "greater",
+             conf.level = 0.95)$p.value
+}
+data_binom$pValue = apply(X = data_binom, MARGIN = 1, FUN = function_PV)
+final_table = inner_join(data_binom, gene_res, by=c("id", "count"="graded_TRUE", "total")) %>% 
+  filter(count > 0) %>%
+  mutate(qval = p.adjust(pValue, "fdr"))
+final_table = final_table %>% 
+  mutate(conditions = case_when(pValue <= 0.05 & AP == TRUE ~ "Enriched and AP",
+                                pValue > 0.05 & AP == TRUE ~ "Not enriched and AP",
+                                pValue <= 0.05 ~ "Enriched",
+                                TRUE ~ "Not enriched"))
+final_table = left_join(final_table, chick_BM, by=c("gene_id" = "ensembl_gene_id"))
+
+plot = ggplot(final_table, aes(count, total, colour = conditions, fill = conditions, label=external_gene_name)) + 
+  scale_colour_manual(values = c("#2171B5", "darkorange2", "grey", "darkorange2"), aesthetics = c("colour", "fill")) +
+  geom_point(shape = 21, alpha = 0.5, size = 2, position = position_jitter()) + theme_classic() +
+  labs(x = "# of pCREs near gene",
+       y = "Total # of CREs near gene",
+       fill = "", colour = "") + 
+  theme(legend.position = "bottom") +
+  geom_text_repel(data=dplyr::filter(final_table, conditions == "Enriched and AP"), color = "black", show.legend = FALSE, max.overlaps = 30)
+plot
+```
+
+
+Plot ATAC and CUT&RUN peaks in OTX2 and WNT5A loci
+```{r}
+ATAC_counts_mvav = read.table(file="ATAC_HH5_counts_mvav.txt")
+ATAC_counts_mvav_long = melt(ATAC_counts_mvav, id.vars = "peak")
+ATAC_counts_mvav_long = ATAC_counts_mvav_long %>% dplyr::mutate(exp="ATAC")
+
+HH5_counts_mvav = read.table("CR_HH5_counts_mvav.txt")
+HH5_counts_mvav_long = melt(HH5_counts_mvav, id.vars = "peak")
+HH5_counts_mvav_long = HH5_counts_mvav_long %>% dplyr::mutate(exp="CR")
+
+OTX2_peaks = c("5:55895551-55896777", "5:55908709-55909380", 
+               "5:55918866-55919340", "5:55930763-55931901", "5:55943807-55944989",
+               "5:55953189-55954040", "5:55985208-55986946", "5:55996263-55997582")
+OTX2_plot = ggplot(data = dplyr::filter(rbind(ATAC_counts_mvav_long, HH5_counts_mvav_long), peak%in%OTX2_peaks), 
+       aes(x=variable, y=value, group=peak, color=peak)) + geom_line() + theme_classic() + 
+  xlab(NULL) + ylab('counts') + facet_wrap(~exp, ncol = 2) + scale_color_brewer(palette="Blues")
+OTX2_plot
+
+WNT5A_peaks = c("12:8207428-8208183", "12:8247822-8248744", "12:8257843-8258792", 
+               "12:8263296-8264088", "12:8273950-8274635", "12:8287734-8288618", 
+               "12:8315370-8317439", "12:8333128-8333664")
+WNT5A_plot = ggplot(data = dplyr::filter(rbind(ATAC_counts_mvav_long, HH5_counts_mvav_long), peak%in%WNT5A_peaks), 
+       aes(x=variable, y=value, group=peak, color=peak)) + geom_line() + theme_classic() + 
+  xlab(NULL) + ylab('counts') + facet_wrap(~exp, ncol = 2) + scale_color_brewer(palette="Purples")
+WNT5A_plot
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
